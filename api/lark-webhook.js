@@ -1,3 +1,6 @@
+// Simple in-memory deduplication (resets on cold start, but good enough)
+const processedMessages = new Set();
+
 export default async function handler(req, res) {
   // Handle GET request (health check)
   if (req.method === "GET") {
@@ -13,35 +16,58 @@ export default async function handler(req, res) {
       return res.status(200).json({ challenge: data.challenge });
     }
 
-    // Handle message event
+    // Respond immediately to prevent Lark retry
+    res.status(200).json({ ok: true });
+
+    // Handle message event in background
     const event = data.event || {};
     const message = event.message;
 
-    if (message) {
-      const messageId = message.message_id;
-      let content = {};
+    if (!message) return;
 
+    const messageId = message.message_id;
+
+    // Skip if already processed (deduplication)
+    if (processedMessages.has(messageId)) {
+      console.log("Duplicate message, skipping:", messageId);
+      return;
+    }
+    processedMessages.add(messageId);
+
+    // Clean up old messages (keep set small)
+    if (processedMessages.size > 100) {
+      const first = processedMessages.values().next().value;
+      processedMessages.delete(first);
+    }
+
+    // Skip bot messages (don't reply to ourselves)
+    const senderType = event.sender?.sender_type;
+    if (senderType === "app") {
+      console.log("Bot message, skipping");
+      return;
+    }
+
+    let content = {};
+    try {
+      content = JSON.parse(message.content || "{}");
+    } catch (e) {
+      content = {};
+    }
+
+    let userText = content.text || "";
+    // Remove @mention
+    userText = userText.replace(/@_user_\d+\s*/g, "").trim();
+
+    if (userText && messageId) {
       try {
-        content = JSON.parse(message.content || "{}");
-      } catch (e) {
-        content = {};
-      }
-
-      let userText = content.text || "";
-      // Remove @mention
-      userText = userText.replace(/@_user_\d+\s*/g, "").trim();
-
-      if (userText && messageId) {
-        try {
-          const claudeResponse = await callClaude(userText);
-          await replyToLark(messageId, claudeResponse);
-        } catch (error) {
-          console.error("Error:", error);
-        }
+        const claudeResponse = await callClaude(userText);
+        await replyToLark(messageId, claudeResponse);
+      } catch (error) {
+        console.error("Error:", error);
       }
     }
 
-    return res.status(200).json({ ok: true });
+    return;
   }
 
   return res.status(405).json({ error: "Method not allowed" });
