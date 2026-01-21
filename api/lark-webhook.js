@@ -2,47 +2,31 @@
 const REDIS_URL = () => process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = () => process.env.UPSTASH_REDIS_REST_TOKEN;
 
-async function redisGet(key) {
-  const res = await fetch(`${REDIS_URL()}/get/${key}`, {
-    headers: { Authorization: `Bearer ${REDIS_TOKEN()}` },
+async function redisCommand(command) {
+  const res = await fetch(REDIS_URL(), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${REDIS_TOKEN()}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(command),
   });
   const data = await res.json();
   return data.result;
 }
 
-async function redisSet(key, value, exSeconds = null) {
-  const url = exSeconds
-    ? `${REDIS_URL()}/set/${key}?EX=${exSeconds}`
-    : `${REDIS_URL()}/set/${key}`;
-  // Value is already a string, don't double-stringify
-  await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${REDIS_TOKEN()}`,
-    },
-    body: value,
-  });
-}
-
-async function redisDel(key) {
-  await fetch(`${REDIS_URL()}/del/${key}`, {
-    headers: { Authorization: `Bearer ${REDIS_TOKEN()}` },
-  });
-}
-
 async function checkAndSetMessage(messageId) {
-  const exists = await redisGet(`msg:${messageId}`);
-  if (exists) return true;
-  await redisSet(`msg:${messageId}`, "1", 300);
-  return false;
+  // SETNX with expiry - returns "OK" if set, null if exists
+  const result = await redisCommand(["SET", `msg:${messageId}`, "1", "EX", 300, "NX"]);
+  return result === null; // true = duplicate, false = new message
 }
 
 // Conversation memory functions
 async function getConversationHistory(sessionId) {
-  const history = await redisGet(`session:${sessionId}`);
-  if (history) {
+  const result = await redisCommand(["GET", `session:${sessionId}`]);
+  if (result) {
     try {
-      return JSON.parse(history);
+      return JSON.parse(result);
     } catch {
       return [];
     }
@@ -54,11 +38,11 @@ async function saveConversationHistory(sessionId, messages) {
   // Keep last 50 messages
   const trimmed = messages.slice(-50);
   // Expire after 6 hours (21600 seconds)
-  await redisSet(`session:${sessionId}`, JSON.stringify(trimmed), 21600);
+  await redisCommand(["SET", `session:${sessionId}`, JSON.stringify(trimmed), "EX", 21600]);
 }
 
 async function clearConversationHistory(sessionId) {
-  await redisDel(`session:${sessionId}`);
+  await redisCommand(["DEL", `session:${sessionId}`]);
 }
 
 export default async function handler(req, res) {
@@ -130,6 +114,13 @@ export default async function handler(req, res) {
 
       // Get conversation history for this topic
       let history = await getConversationHistory(sessionId);
+      console.log("History type:", typeof history, Array.isArray(history));
+
+      // Ensure history is an array
+      if (!Array.isArray(history)) {
+        console.log("History was not array, resetting");
+        history = [];
+      }
 
       // Add user message to history
       history.push({ role: "user", content: userText });
