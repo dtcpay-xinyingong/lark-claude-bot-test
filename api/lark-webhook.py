@@ -59,8 +59,12 @@ def reply_to_lark(message_id: str, text: str):
         return json.loads(res.read())
 
 
-@app.route("/api/lark-webhook", methods=["POST"])
+@app.route("/", methods=["GET", "POST"])
 def webhook():
+    # Handle GET request (basic health check)
+    if request.method == "GET":
+        return jsonify({"status": "ok"})
+
     data = request.get_json() or {}
 
     # Handle URL verification challenge from Lark
@@ -89,7 +93,3 @@ def webhook():
             print(f"Error processing message: {e}")
 
     return jsonify({"ok": True})
-
-
-# For Vercel
-handler = app
