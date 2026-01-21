@@ -1,4 +1,4 @@
-// Simple in-memory deduplication (resets on cold start, but good enough)
+// Simple in-memory deduplication
 const processedMessages = new Set();
 
 export default async function handler(req, res) {
@@ -16,21 +16,20 @@ export default async function handler(req, res) {
       return res.status(200).json({ challenge: data.challenge });
     }
 
-    // Respond immediately to prevent Lark retry
-    res.status(200).json({ ok: true });
-
-    // Handle message event in background
+    // Handle message event
     const event = data.event || {};
     const message = event.message;
 
-    if (!message) return;
+    if (!message) {
+      return res.status(200).json({ ok: true });
+    }
 
     const messageId = message.message_id;
 
     // Skip if already processed (deduplication)
     if (processedMessages.has(messageId)) {
       console.log("Duplicate message, skipping:", messageId);
-      return;
+      return res.status(200).json({ ok: true, skipped: "duplicate" });
     }
     processedMessages.add(messageId);
 
@@ -44,7 +43,7 @@ export default async function handler(req, res) {
     const senderType = event.sender?.sender_type;
     if (senderType === "app") {
       console.log("Bot message, skipping");
-      return;
+      return res.status(200).json({ ok: true, skipped: "bot" });
     }
 
     let content = {};
@@ -58,16 +57,21 @@ export default async function handler(req, res) {
     // Remove @mention
     userText = userText.replace(/@_user_\d+\s*/g, "").trim();
 
-    if (userText && messageId) {
-      try {
-        const claudeResponse = await callClaude(userText);
-        await replyToLark(messageId, claudeResponse);
-      } catch (error) {
-        console.error("Error:", error);
-      }
+    if (!userText || !messageId) {
+      return res.status(200).json({ ok: true, skipped: "no text" });
     }
 
-    return;
+    try {
+      console.log("Processing message:", userText);
+      const claudeResponse = await callClaude(userText);
+      console.log("Claude response received");
+      await replyToLark(messageId, claudeResponse);
+      console.log("Reply sent to Lark");
+      return res.status(200).json({ ok: true, replied: true });
+    } catch (error) {
+      console.error("Error:", error);
+      return res.status(200).json({ ok: false, error: error.message });
+    }
   }
 
   return res.status(405).json({ error: "Method not allowed" });
@@ -109,7 +113,7 @@ async function callClaude(userMessage) {
 
 async function replyToLark(messageId, text) {
   const token = await getLarkToken();
-  await fetch(
+  const response = await fetch(
     `https://open.larksuite.com/open-apis/im/v1/messages/${messageId}/reply`,
     {
       method: "POST",
@@ -123,4 +127,7 @@ async function replyToLark(messageId, text) {
       }),
     }
   );
+  const data = await response.json();
+  console.log("Lark reply response:", data);
+  return data;
 }
