@@ -1,5 +1,25 @@
-// Simple in-memory deduplication
-const processedMessages = new Set();
+// Upstash Redis for deduplication
+async function checkAndSetMessage(messageId) {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+  // Check if message already processed
+  const getRes = await fetch(`${url}/get/msg:${messageId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const getData = await getRes.json();
+
+  if (getData.result) {
+    return true; // Already processed
+  }
+
+  // Mark as processed (expires in 5 minutes)
+  await fetch(`${url}/set/msg:${messageId}/1?EX=300`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  return false; // Not a duplicate
+}
 
 export default async function handler(req, res) {
   // Handle GET request (health check)
@@ -26,20 +46,18 @@ export default async function handler(req, res) {
 
     const messageId = message.message_id;
 
-    // Skip if already processed (deduplication)
-    if (processedMessages.has(messageId)) {
-      console.log("Duplicate message, skipping:", messageId);
-      return res.status(200).json({ ok: true, skipped: "duplicate" });
-    }
-    processedMessages.add(messageId);
-
-    // Clean up old messages (keep set small)
-    if (processedMessages.size > 100) {
-      const first = processedMessages.values().next().value;
-      processedMessages.delete(first);
+    // Check for duplicate using Upstash Redis
+    try {
+      const isDuplicate = await checkAndSetMessage(messageId);
+      if (isDuplicate) {
+        console.log("Duplicate message, skipping:", messageId);
+        return res.status(200).json({ ok: true, skipped: "duplicate" });
+      }
+    } catch (e) {
+      console.log("Redis error (continuing anyway):", e.message);
     }
 
-    // Skip bot messages (don't reply to ourselves)
+    // Skip bot messages
     const senderType = event.sender?.sender_type;
     if (senderType === "app") {
       console.log("Bot message, skipping");
@@ -54,7 +72,6 @@ export default async function handler(req, res) {
     }
 
     let userText = content.text || "";
-    // Remove @mention
     userText = userText.replace(/@_user_\d+\s*/g, "").trim();
 
     if (!userText || !messageId) {
