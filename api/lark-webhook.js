@@ -1,42 +1,78 @@
-// Upstash Redis for deduplication
+// Upstash Redis for deduplication and conversation memory
+const REDIS_URL = () => process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = () => process.env.UPSTASH_REDIS_REST_TOKEN;
+
+async function redisGet(key) {
+  const res = await fetch(`${REDIS_URL()}/get/${key}`, {
+    headers: { Authorization: `Bearer ${REDIS_TOKEN()}` },
+  });
+  const data = await res.json();
+  return data.result;
+}
+
+async function redisSet(key, value, exSeconds = null) {
+  const url = exSeconds
+    ? `${REDIS_URL()}/set/${key}?EX=${exSeconds}`
+    : `${REDIS_URL()}/set/${key}`;
+  await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${REDIS_TOKEN()}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(value),
+  });
+}
+
+async function redisDel(key) {
+  await fetch(`${REDIS_URL()}/del/${key}`, {
+    headers: { Authorization: `Bearer ${REDIS_TOKEN()}` },
+  });
+}
+
 async function checkAndSetMessage(messageId) {
-  const url = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  const exists = await redisGet(`msg:${messageId}`);
+  if (exists) return true;
+  await redisSet(`msg:${messageId}`, "1", 300);
+  return false;
+}
 
-  // Check if message already processed
-  const getRes = await fetch(`${url}/get/msg:${messageId}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  const getData = await getRes.json();
-
-  if (getData.result) {
-    return true; // Already processed
+// Conversation memory functions
+async function getConversationHistory(sessionId) {
+  const history = await redisGet(`session:${sessionId}`);
+  if (history) {
+    try {
+      return JSON.parse(history);
+    } catch {
+      return [];
+    }
   }
+  return [];
+}
 
-  // Mark as processed (expires in 5 minutes)
-  await fetch(`${url}/set/msg:${messageId}/1?EX=300`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+async function saveConversationHistory(sessionId, messages) {
+  // Keep last 50 messages
+  const trimmed = messages.slice(-50);
+  // Expire after 6 hours (21600 seconds)
+  await redisSet(`session:${sessionId}`, JSON.stringify(trimmed), 21600);
+}
 
-  return false; // Not a duplicate
+async function clearConversationHistory(sessionId) {
+  await redisDel(`session:${sessionId}`);
 }
 
 export default async function handler(req, res) {
-  // Handle GET request (health check)
   if (req.method === "GET") {
     return res.status(200).json({ status: "ok" });
   }
 
-  // Handle POST request
   if (req.method === "POST") {
     const data = req.body || {};
 
-    // Handle Lark URL verification
     if (data.challenge) {
       return res.status(200).json({ challenge: data.challenge });
     }
 
-    // Handle message event
     const event = data.event || {};
     const message = event.message;
 
@@ -45,8 +81,12 @@ export default async function handler(req, res) {
     }
 
     const messageId = message.message_id;
+    const chatId = message.chat_id;
+    // Use root_id for thread/topic, fall back to chat_id for non-threaded messages
+    const rootId = message.root_id;
+    const sessionId = rootId || chatId;
 
-    // Check for duplicate using Upstash Redis
+    // Deduplication
     try {
       const isDuplicate = await checkAndSetMessage(messageId);
       if (isDuplicate) {
@@ -54,13 +94,12 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: true, skipped: "duplicate" });
       }
     } catch (e) {
-      console.log("Redis error (continuing anyway):", e.message);
+      console.log("Redis error:", e.message);
     }
 
     // Skip bot messages
     const senderType = event.sender?.sender_type;
     if (senderType === "app") {
-      console.log("Bot message, skipping");
       return res.status(200).json({ ok: true, skipped: "bot" });
     }
 
@@ -78,10 +117,33 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, skipped: "no text" });
     }
 
+    // Handle /clear command
+    if (userText.toLowerCase() === "/clear") {
+      await clearConversationHistory(sessionId);
+      await replyToLark(messageId, "Conversation history cleared for this topic.");
+      return res.status(200).json({ ok: true, cleared: true });
+    }
+
     try {
       console.log("Processing message:", userText);
-      const claudeResponse = await callClaude(userText);
+      console.log("Session ID (topic/thread):", sessionId);
+
+      // Get conversation history for this topic
+      let history = await getConversationHistory(sessionId);
+
+      // Add user message to history
+      history.push({ role: "user", content: userText });
+
+      // Call Claude with full history
+      const claudeResponse = await callClaude(history);
       console.log("Claude response received");
+
+      // Add assistant response to history
+      history.push({ role: "assistant", content: claudeResponse });
+
+      // Save updated history
+      await saveConversationHistory(sessionId, history);
+
       await replyToLark(messageId, claudeResponse);
       console.log("Reply sent to Lark");
       return res.status(200).json({ ok: true, replied: true });
@@ -110,7 +172,7 @@ async function getLarkToken() {
   return data.tenant_access_token;
 }
 
-async function callClaude(userMessage) {
+async function callClaude(messages) {
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -121,7 +183,9 @@ async function callClaude(userMessage) {
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514",
       max_tokens: 1024,
-      messages: [{ role: "user", content: userMessage }],
+      system:
+        "You are a helpful assistant in a Lark group chat. Keep responses concise but helpful. You remember previous messages in this conversation thread.",
+      messages: messages,
     }),
   });
   const data = await response.json();
