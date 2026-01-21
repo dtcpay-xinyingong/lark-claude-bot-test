@@ -14,13 +14,13 @@ async function redisSet(key, value, exSeconds = null) {
   const url = exSeconds
     ? `${REDIS_URL()}/set/${key}?EX=${exSeconds}`
     : `${REDIS_URL()}/set/${key}`;
+  // Value is already a string, don't double-stringify
   await fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${REDIS_TOKEN()}`,
-      "Content-Type": "application/json",
     },
-    body: JSON.stringify(value),
+    body: value,
   });
 }
 
